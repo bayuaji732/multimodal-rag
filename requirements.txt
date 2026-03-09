@@ -1,0 +1,43 @@
+# ─── Core ────────────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart
+
+# ─── LLMs ────────────────────────────────────────────────────────────────────
+openai
+anthropic
+
+# ─── Document Parsing ─────────────────────────────────────────────────────────
+pdfplumber
+unstructured[pdf,image,docx]
+pillow
+
+# ─── Embeddings & ML ─────────────────────────────────────────────────────────
+transformers
+torch
+torchvision
+tokenizers
+sentence-transformers
+open-clip-torch
+ml_dtypes
+onnx
+
+# ─── Vector Store ────────────────────────────────────────────────────────────
+qdrant-client==1.11.3       # same version with qdrant docker image
+
+# ─── Sparse / BM25 ───────────────────────────────────────────────────────────
+rank-bm25
+
+# ─── Re-ranking ──────────────────────────────────────────────────────────────
+cohere
+
+# ─── Async job queue ─────────────────────────────────────────────────────────
+celery[redis]
+redis
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+numpy
+httpx
+streamlit
