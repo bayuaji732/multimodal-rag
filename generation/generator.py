@@ -1,12 +1,17 @@
 """
 generation/generator.py
 ────────────────────────
-RAG answer generator with:
-  • Multi-modal context assembly (text + image)
-  • GPT-4o / Claude 3.5 generation
-  • Citation extraction from model output
-  • NLI hallucination guard — verifies each sentence against retrieved chunks
-  • Streaming support
+RAG answer generator.
+
+TABLE UPGRADES (v2):
+  • Table chunks are rendered as BOTH the markdown table AND its NL summary in
+    the context block — the model sees structured data AND searchable semantics.
+  • System prompt explicitly instructs the model on table reasoning:
+    - Read every row, not just headers
+    - Compute aggregates if asked (sum, average, max, min)
+    - Quote exact cell values when making numeric claims
+  • _build_context_messages() separates TABLE blocks with a visual rule so the
+    model doesn't conflate table rows with prose sentences.
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ log = logging.getLogger(__name__)
 # ─── NLI hallucination guard ──────────────────────────────────────────────────
 
 _nli_tokenizer = None
-_nli_model = None
+_nli_model     = None
 
 
 def _get_nli():
@@ -42,43 +47,37 @@ def _get_nli():
 
 
 def check_entailment(premise: str, hypothesis: str) -> float:
-    """
-    Returns entailment probability in [0, 1].
-    Uses DeBERTa-v3 NLI model.
-    """
     tok, model = _get_nli()
-    enc = tok(premise, hypothesis, return_tensors="pt",
-               truncation=True, max_length=512)
+    enc = tok(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
         logits = model(**enc).logits
     probs = torch.softmax(logits, dim=-1)[0]
-    # Label order: contradiction=0, neutral=1, entailment=2
     return probs[2].item()
 
 
 def guard_answer(answer: str, chunks: list[RetrievedChunk]) -> tuple[str, list[str]]:
-    """
-    Split answer into sentences, verify each against top retrieved chunks.
-    Returns (verified_answer, list_of_warnings).
-    
-    Sentences with entailment_score < threshold are flagged with [⚠ unverified].
-    """
     sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
-    context = " ".join(c.chunk.text for c in chunks[:5])  # top 5 chunks as premise
+    # For tables, use the summary as premise (markdown confuses NLI)
+    context_parts = []
+    for c in chunks[:5]:
+        if c.chunk.chunk_type == ChunkType.TABLE and c.chunk.table_summary:
+            context_parts.append(c.chunk.table_summary)
+        else:
+            context_parts.append(c.chunk.text)
+    context = " ".join(context_parts)
+
     warnings: list[str] = []
     verified_parts: list[str] = []
-
     for sent in sentences:
-        if len(sent.split()) < 5:  # skip very short sentences
+        if len(sent.split()) < 5:
             verified_parts.append(sent)
             continue
         score = check_entailment(context, sent)
         if score < settings.nli_threshold:
             verified_parts.append(f"{sent} [⚠ unverified]")
-            warnings.append(f"Low entailment ({score:.2f}): {sent[:80]}...")
+            warnings.append(f"Low entailment ({score:.2f}): {sent[:80]}…")
         else:
             verified_parts.append(sent)
-
     return " ".join(verified_parts), warnings
 
 
@@ -96,33 +95,73 @@ class Citation:
 
 @dataclass
 class GenerationResult:
-    answer: str
-    citations: list[Citation] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    model: str = ""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
+    answer:            str
+    citations:         list[Citation] = field(default_factory=list)
+    warnings:          list[str]      = field(default_factory=list)
+    model:             str  = ""
+    prompt_tokens:     int  = 0
+    completion_tokens: int  = 0
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """\
+You are a precise, evidence-based assistant. Answer questions using ONLY the
+provided context blocks. For every factual claim, cite the source with [n].
+
+TABLE REASONING RULES — follow these strictly when context contains tables:
+1. Read EVERY row in full; do not skip rows.
+2. When asked for a maximum, minimum, sum, average, or count — compute it from
+   the table data; do not guess.
+3. Quote exact cell values (numbers, names, dates) when making numeric claims.
+4. If a table has a title or caption, use it to understand the table's subject.
+5. If multiple tables are relevant, compare them explicitly.
+6. If the table does not contain enough information, say so clearly.
+
+Formatting:
+- Use bullet points for lists.
+- Reproduce small relevant table excerpts (≤5 rows) in Markdown when helpful.
+- Cite sources as [1], [2], … at the end of each sentence that uses that source.
+"""
+
+
+def _format_table_block(index: int, chunk: DocumentChunk) -> list[dict]:
+    """
+    Render a table context block with:
+      • title (if any)
+      • NL summary   → helps model understand semantics
+      • raw markdown → gives model exact cell values to quote
+    """
+    parts: list[dict] = []
+
+    header = f"\n[{index}] TABLE — Source: {chunk.doc_name}, page {chunk.page}"
+    if chunk.table_title:
+        header += f"\nTitle: {chunk.table_title}"
+    if chunk.table_headers:
+        header += f"\nColumns: {', '.join(chunk.table_headers)}"
+    header += f"\nDimensions: {chunk.table_rows} data rows × {chunk.table_cols} columns"
+
+    if chunk.table_summary:
+        header += f"\n\nSummary: {chunk.table_summary}"
+
+    header += "\n\nFull table (use exact values from here when answering):\n"
+    header += chunk.text   # markdown table
+    header += "\n" + "─" * 60 + "\n"
+
+    parts.append({"type": "text", "text": header})
+    return parts
 
 
 def _build_context_messages(
     query: str,
     chunks: list[RetrievedChunk],
 ) -> tuple[list[dict], list[Citation]]:
-    """
-    Build OpenAI-style messages array with interleaved text and images.
-    Returns (messages, citations).
-    """
     citations: list[Citation] = []
     context_parts: list[dict] = []
 
     context_parts.append({
         "type": "text",
-        "text": (
-            "You are a precise, evidence-based assistant. Answer the user's question "
-            "using ONLY the provided context. For every factual claim, cite the source "
-            "using [1], [2], ... notation corresponding to the context blocks below.\n\n"
-            "─── CONTEXT ───\n"
-        ),
+        "text": "─── CONTEXT ───\n",
     })
 
     for i, rc in enumerate(chunks, start=1):
@@ -132,24 +171,38 @@ def _build_context_messages(
             doc_name=chunk.doc_name,
             page=chunk.page,
             chunk_type=chunk.chunk_type.value,
-            text_snippet=chunk.text[:200],
+            text_snippet=(chunk.table_summary or chunk.text)[:200],
             image_b64=chunk.image_b64,
         )
         citations.append(cit)
 
-        context_parts.append({
-            "type": "text",
-            "text": f"\n[{i}] Source: {chunk.doc_name}, page {chunk.page} ({chunk.chunk_type.value})\n{chunk.text}\n",
-        })
+        if chunk.chunk_type == ChunkType.TABLE:
+            context_parts.extend(_format_table_block(i, chunk))
 
-        # Include image if present
-        if chunk.chunk_type == ChunkType.IMAGE and chunk.image_b64:
+        elif chunk.chunk_type == ChunkType.IMAGE:
             context_parts.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{chunk.image_b64}",
-                    "detail": "low",
-                },
+                "type": "text",
+                "text": (
+                    f"\n[{i}] IMAGE — Source: {chunk.doc_name}, page {chunk.page}\n"
+                    f"Caption: {chunk.text}\n"
+                ),
+            })
+            if chunk.image_b64:
+                context_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{chunk.image_b64}",
+                        "detail": "low",
+                    },
+                })
+
+        else:  # TEXT
+            context_parts.append({
+                "type": "text",
+                "text": (
+                    f"\n[{i}] TEXT — Source: {chunk.doc_name}, page {chunk.page}\n"
+                    f"{chunk.text}\n"
+                ),
             })
 
     context_parts.append({
@@ -157,7 +210,10 @@ def _build_context_messages(
         "text": f"\n─── QUESTION ───\n{query}\n\nAnswer (cite sources with [n]):",
     })
 
-    messages = [{"role": "user", "content": context_parts}]
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user",   "content": context_parts},
+    ]
     return messages, citations
 
 
@@ -174,10 +230,9 @@ class RAGGenerator:
         chunks: list[RetrievedChunk],
         apply_guard: bool = True,
     ) -> GenerationResult:
-        """Synchronous RAG generation."""
         if not chunks:
             return GenerationResult(
-                answer="I couldn't find relevant information in the knowledge base to answer your question.",
+                answer="I couldn't find relevant information in the knowledge base."
             )
 
         messages, citations = _build_context_messages(query, chunks)
@@ -208,27 +263,28 @@ class RAGGenerator:
             model=settings.llm_model,
             messages=messages,
             max_tokens=1024,
-            temperature=0.1,
+            temperature=0.0,   # 0 for factual table reading
         )
-        text = resp.choices[0].message.content or ""
+        text  = resp.choices[0].message.content or ""
         usage = {
-            "prompt_tokens": resp.usage.prompt_tokens,
+            "prompt_tokens":     resp.usage.prompt_tokens,
             "completion_tokens": resp.usage.completion_tokens,
         }
         return text, usage
 
     def _generate_anthropic(self, messages: list[dict]) -> tuple[str, dict]:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        # Convert OpenAI-style image_url to Anthropic image blocks
-        content = _convert_to_anthropic_content(messages[0]["content"])
+        system_prompt = messages[0]["content"] if messages[0]["role"] == "system" else ""
+        user_content  = _convert_to_anthropic_content(messages[1]["content"])
         resp = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=1024,
-            messages=[{"role": "user", "content": content}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
         )
-        text = resp.content[0].text
+        text  = resp.content[0].text
         usage = {
-            "prompt_tokens": resp.usage.input_tokens,
+            "prompt_tokens":     resp.usage.input_tokens,
             "completion_tokens": resp.usage.output_tokens,
         }
         return text, usage
@@ -238,7 +294,6 @@ class RAGGenerator:
         query: str,
         chunks: list[RetrievedChunk],
     ) -> AsyncIterator[str]:
-        """Async streaming generation — yields text tokens."""
         if not chunks:
             yield "I couldn't find relevant information to answer your question."
             return
@@ -250,7 +305,7 @@ class RAGGenerator:
             model=settings.llm_model,
             messages=messages,
             max_tokens=1024,
-            temperature=0.1,
+            temperature=0.0,
         ) as stream:
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
@@ -261,7 +316,6 @@ class RAGGenerator:
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
 def _convert_to_anthropic_content(oai_content: list[dict]) -> list[dict]:
-    """Convert OpenAI content blocks to Anthropic format."""
     out: list[dict] = []
     for block in oai_content:
         if block["type"] == "text":

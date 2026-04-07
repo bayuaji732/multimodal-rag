@@ -1,18 +1,21 @@
 """
 ingestion/embedder.py
 ─────────────────────
-Multi-modal embedding layer:
+Multi-modal embedding layer.
 
-  TEXT / TABLE → OpenAI text-embedding-3-large  (dense)
-                 BM25 tokeniser                  (sparse)
-  IMAGE        → CLIP ViT-L/14                   (dense, projected to text space)
-               + caption via GPT-4o Vision       → text dense embed too
-               + BM25 on caption                 (sparse)
+TABLE UPGRADES (v2):
+  • summarize_table()  — GPT-4o converts the markdown table to a rich NL summary
+                         that describes WHAT the table shows, its headers, numeric
+                         ranges, trends, and any notable cells.
+  • Tables are embedded on the SUMMARY text (not raw markdown), which dramatically
+    improves semantic retrieval: "highest revenue quarter" now matches the table.
+  • The original markdown is kept in chunk.text for the generator to render.
+  • table_summary stored in DocumentChunk and Qdrant payload for UI display.
 
-ColPali-style late interaction:
-  For image chunks we produce *both* a CLIP vector and a caption-text vector,
-  and store both under separate named vectors in Qdrant so the retriever can
-  do patch-level matching when needed.
+Embedding strategy per chunk type:
+  TEXT  / TABLE  → OpenAI text-embedding-3-large on (text / summary)
+  IMAGE          → caption via GPT-4o Vision, then embed caption
+  ALL            → BM25 sparse on the richest available text
 """
 from __future__ import annotations
 
@@ -29,22 +32,18 @@ from utils.models import ChunkType, DocumentChunk
 
 log = logging.getLogger(__name__)
 
-# ─── singletons (loaded once per worker) ──────────────────────────────────────
-# Heavy ML imports are deferred inside _get_* functions so that Celery can
-# import this module without triggering the full torch/torchvision/onnx chain
-# at startup (which causes the ml_dtypes.float4_e2m1fn crash on Windows).
+# ─── singletons ───────────────────────────────────────────────────────────────
 
-_clip_model = None
-_clip_tokenizer = None
-_clip_transform = None
+_clip_model       = None
+_clip_tokenizer   = None
+_clip_transform   = None
 _openai_client: Optional[object] = None
 
 
 def _get_clip():
-    """Lazy-load open_clip (avoids torchvision→onnx→ml_dtypes import at module load)."""
     global _clip_model, _clip_tokenizer, _clip_transform
     if _clip_model is None:
-        import open_clip  # open_clip_torch — no torchvision dependency
+        import open_clip
         log.info("Loading CLIP via open_clip: ViT-L-14")
         _clip_model, _, _clip_transform = open_clip.create_model_and_transforms(
             "ViT-L-14", pretrained="openai"
@@ -65,26 +64,23 @@ def _get_openai():
 # ─── text dense embedding ──────────────────────────────────────────────────────
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Batch embed texts with OpenAI text-embedding-3-large."""
     client = _get_openai()
     all_vecs: list[list[float]] = []
     batch_size = 256
     for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
         resp = client.embeddings.create(
             model=settings.embedding_model,
-            input=batch,
+            input=texts[i : i + batch_size],
             encoding_format="float",
         )
         all_vecs.extend([d.embedding for d in resp.data])
     return all_vecs
 
 
-# ─── image dense embedding (open_clip) ────────────────────────────────────────
+# ─── image dense embedding ─────────────────────────────────────────────────────
 
 def embed_images(b64_images: list[str]) -> list[list[float]]:
-    """Encode base64 PNGs with CLIP (via open_clip). Returns 768-d vectors."""
-    import io, base64, torch
+    import torch
     model, _, transform = _get_clip()
     imgs = [
         transform(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
@@ -98,7 +94,6 @@ def embed_images(b64_images: list[str]) -> list[list[float]]:
 
 
 def embed_text_clip(texts: list[str]) -> list[list[float]]:
-    """Encode query text with CLIP text encoder for image retrieval."""
     import torch
     model, tokenizer, _ = _get_clip()
     tokens = tokenizer(texts)
@@ -108,10 +103,9 @@ def embed_text_clip(texts: list[str]) -> list[list[float]]:
     return feats.cpu().float().numpy().tolist()
 
 
-# ─── image captioning (GPT-4o Vision) ─────────────────────────────────────────
+# ─── image captioning ──────────────────────────────────────────────────────────
 
 def caption_image(b64: str, existing_caption: str = "") -> str:
-    """Generate a rich text caption for an image chunk via GPT-4o Vision."""
     client = _get_openai()
     prompt = (
         "You are an expert document analyst. Describe this figure/chart/diagram "
@@ -139,29 +133,69 @@ def caption_image(b64: str, existing_caption: str = "") -> str:
         return existing_caption or "Image"
 
 
+# ─── TABLE SUMMARIZATION ──────────────────────────────────────────────────────
+
+_TABLE_SUMMARY_PROMPT = """\
+You are a data analyst. Below is a markdown table extracted from a document.
+
+Your task:
+1. Write a concise natural-language SUMMARY (2-5 sentences) that describes:
+   - What the table is about (topic / subject)
+   - Column headers and what each measures
+   - Key numeric values, ranges, totals, or percentages visible
+   - Any obvious trends, maximums, minimums, or notable rows
+2. After the summary, list the column headers as a comma-separated line
+   prefixed with "Headers:".
+
+Do NOT reproduce the table verbatim. Focus on meaning and searchable facts.
+
+Table:
+{markdown}
+"""
+
+
+def summarize_table(markdown: str, title: str | None = None) -> str:
+    """
+    Use GPT-4o-mini to generate a rich NL summary of a markdown table.
+    The summary is used as the embedding text so semantic search works
+    ("what quarter had highest revenue" → finds the revenue table).
+    """
+    client = _get_openai()
+    header_hint = f'Table title/caption: "{title}"\n\n' if title else ""
+    prompt = _TABLE_SUMMARY_PROMPT.format(markdown=header_hint + markdown)
+
+    try:
+        resp = client.chat.completions.create(
+            model=settings.llm_model,         # gpt-4o-mini is fast + cheap
+            max_tokens=300,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        log.warning("Table summarization failed: %s", exc)
+        # Fallback: first 500 chars of the raw markdown
+        return markdown[:500]
+
+
 # ─── sparse BM25 encoding ─────────────────────────────────────────────────────
 
 class SparseEncoder:
-    """BM25-style sparse encoding using BERT vocab token IDs."""
-
     def __init__(self):
         self._tokenizer = None
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
-            from tokenizers import Tokenizer  # lazy import
+            from tokenizers import Tokenizer
             self._tokenizer = Tokenizer.from_pretrained("bert-base-uncased")
         return self._tokenizer
 
     def encode(self, text: str) -> tuple[list[int], list[float]]:
-        enc = self._get_tokenizer().encode(text)
-        ids = enc.ids
         from collections import Counter
-        tf = Counter(ids)
-        indices = list(tf.keys())
+        enc = self._get_tokenizer().encode(text)
+        tf  = Counter(enc.ids)
         max_tf = max(tf.values())
-        values = [v / max_tf for v in tf.values()]
-        return indices, values
+        return list(tf.keys()), [v / max_tf for v in tf.values()]
 
 
 _sparse_encoder: Optional[SparseEncoder] = None
@@ -178,43 +212,58 @@ def get_sparse_encoder() -> SparseEncoder:
 
 def embed_chunks(chunks: list[DocumentChunk]) -> list[DocumentChunk]:
     """
-    In-place: sets dense_vector, sparse_indices, sparse_values on each chunk.
-    Also enriches image chunk .text with GPT-4o captions.
+    Sets dense_vector + sparse_indices/values on every chunk.
+    For tables, first generates an LLM summary, embeds the summary,
+    but preserves the original markdown in chunk.text for generation.
     """
     sparse_enc = get_sparse_encoder()
 
-    # Split by type for batching
-    text_idx = [i for i, c in enumerate(chunks) if c.chunk_type != ChunkType.IMAGE]
+    text_idx  = [i for i, c in enumerate(chunks) if c.chunk_type == ChunkType.TEXT]
+    table_idx = [i for i, c in enumerate(chunks) if c.chunk_type == ChunkType.TABLE]
     image_idx = [i for i, c in enumerate(chunks) if c.chunk_type == ChunkType.IMAGE]
 
-    # ── text/table dense embeddings ───────────────────────────────────────────
+    # ── TEXT: embed as-is ─────────────────────────────────────────────────────
     if text_idx:
         texts = [chunks[i].text for i in text_idx]
-        vecs = embed_texts(texts)
+        vecs  = embed_texts(texts)
         for idx, vec in zip(text_idx, vecs):
             chunks[idx].dense_vector = vec
 
-    # ── image chunks ──────────────────────────────────────────────────────────
+    # ── TABLE: summarize → embed summary, keep markdown in .text ──────────────
+    if table_idx:
+        log.info("Summarizing %d table chunk(s) with LLM…", len(table_idx))
+        summaries: list[str] = []
+        for i in table_idx:
+            chunk   = chunks[i]
+            summary = summarize_table(chunk.text, title=chunk.table_title)
+            chunk.table_summary = summary          # stored in payload
+            summaries.append(summary)
+            log.debug("Table summary [page %d]: %s", chunk.page, summary[:120])
+
+        vecs = embed_texts(summaries)
+        for idx, vec in zip(table_idx, vecs):
+            norm = np.linalg.norm(vec)
+            chunks[idx].dense_vector = (np.array(vec) / norm).tolist() if norm > 0 else vec
+
+    # ── IMAGE: caption → embed caption ────────────────────────────────────────
     for i in image_idx:
-        chunk = chunks[i]
-        assert chunk.image_b64, "Image chunk missing base64 data"
-
-        # 1. Generate rich caption
+        chunk   = chunks[i]
         caption = caption_image(chunk.image_b64, existing_caption=chunk.text)
-        chunk.text = caption  # replace sparse caption with rich one
+        chunk.text = caption
 
-        # 2. Caption text vector (OpenAI, same space as text chunks)
-        # CLIP is used query-side in the retriever for cross-modal matching.
-        # Storing CLIP (768-d) + OpenAI (3072-d) together causes shape mismatch
-        # in np.mean — so we use caption embedding as the canonical dense vector.
-        caption_vec = embed_texts([caption])[0]
-        norm = np.linalg.norm(caption_vec)
-        chunk.dense_vector = (np.array(caption_vec) / norm).tolist() if norm > 0 else caption_vec
+        vec  = embed_texts([caption])[0]
+        norm = np.linalg.norm(vec)
+        chunk.dense_vector = (np.array(vec) / norm).tolist() if norm > 0 else vec
 
-    # ── sparse for all chunks ─────────────────────────────────────────────────
+    # ── SPARSE: BM25 on richest text for each chunk ────────────────────────────
+    # For tables: sparse on summary + markdown combined for better keyword recall
     for chunk in chunks:
-        idxs, vals = sparse_enc.encode(chunk.text)
+        if chunk.chunk_type == ChunkType.TABLE and chunk.table_summary:
+            sparse_text = chunk.table_summary + " " + chunk.text
+        else:
+            sparse_text = chunk.text
+        idxs, vals = sparse_enc.encode(sparse_text)
         chunk.sparse_indices = idxs
-        chunk.sparse_values = vals
+        chunk.sparse_values  = vals
 
     return chunks

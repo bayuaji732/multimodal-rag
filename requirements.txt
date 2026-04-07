@@ -14,6 +14,10 @@ pdfplumber
 unstructured[pdf,image,docx]
 pillow
 
+# ─── Spreadsheet / CSV ───────────────────────────────────────────────────────
+openpyxl                    # XLSX read (data_only=True for computed cell values)
+xlrd                        # XLS (legacy Excel) read
+
 # ─── Embeddings & ML ─────────────────────────────────────────────────────────
 transformers
 torch
