@@ -15,8 +15,8 @@ unstructured[pdf,image,docx]
 pillow
 
 # ─── Spreadsheet / CSV ───────────────────────────────────────────────────────
-openpyxl                    # XLSX read (data_only=True for computed cell values)
-xlrd                        # XLS (legacy Excel) read
+openpyxl
+xlrd
 
 # ─── Embeddings & ML ─────────────────────────────────────────────────────────
 transformers
@@ -29,7 +29,7 @@ ml_dtypes
 onnx
 
 # ─── Vector Store ────────────────────────────────────────────────────────────
-qdrant-client==1.11.3       # same version with qdrant docker image
+qdrant-client==1.11.3
 
 # ─── Sparse / BM25 ───────────────────────────────────────────────────────────
 rank-bm25
@@ -41,7 +41,15 @@ cohere
 celery[redis]
 redis
 
+# ─── Orchestration (v3) ──────────────────────────────────────────────────────
+langgraph
+
+# ─── Evaluation (v3) ─────────────────────────────────────────────────────────
+ragas
+datasets
+
 # ─── Utilities ───────────────────────────────────────────────────────────────
 numpy
 httpx
 streamlit
+gradio

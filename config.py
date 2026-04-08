@@ -47,6 +47,22 @@ class Settings(BaseSettings):
     api_port: int = 8000
     max_upload_mb: int = 50
 
+    # ── Advanced RAG (v3 upgrade) ─────────────────────────────────────────────
+
+    # Query rewriting: generate n alternative phrasings and merge results
+    use_query_rewriting: bool = True
+    n_rewrite_variants: int = 2
+
+    # HyDE: embed a hypothetical answer passage instead of the raw query
+    use_hyde: bool = False
+
+    # LangGraph orchestration with multi-hop decomposition
+    use_orchestration: bool = True
+    max_sub_queries: int = 4
+
+    # Observability: append JSON trace lines to this file
+    trace_log_file: str = "logs/rag_traces.jsonl"
+
     class Config:
         env_file = ".env"
         extra = "ignore"
